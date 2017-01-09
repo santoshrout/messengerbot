@@ -13,6 +13,7 @@ const request = require('request');
 const JSONbig = require('json-bigint');
 const async = require('async');
 
+
 const REST_PORT = (process.env.PORT || 80);
 const APIAI_ACCESS_TOKEN = '00xxxxxxxxxxxxxxxxxxxxxxxx'; //process.env.APIAI_ACCESS_TOKEN
 const APIAI_LANG = process.env.APIAI_LANG || 'en';
@@ -22,11 +23,12 @@ const FB_PAGE_ACCESS_TOKEN = 'XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX'
 const apiAiService = apiai(APIAI_ACCESS_TOKEN, {language: APIAI_LANG, requestSource: "fb"});
 const sessionIds = new Map();
 
+
 function processEvent(event) {
     var sender = event.sender.id.toString();
 
-    if (event.message && event.message.text) {
-        var text = event.message.text;
+    if ((event.message && event.message.text) || (event.postback && event.postback.payload)) {
+        var text = event.message ? event.message.text : event.postback.payload;
         // Handle a text message from this sender
 
         if (!sessionIds.has(sender)) {
@@ -41,23 +43,39 @@ function processEvent(event) {
             });
 
         apiaiRequest.on('response', (response) => {
-			console.log (response);
             if (isDefined(response.result)) {
                 let responseText = response.result.fulfillment.speech;
                 let responseData = response.result.fulfillment.data;
                 let action = response.result.action;
 
                 if (isDefined(responseData) && isDefined(responseData.facebook)) {
-                    try {
-                        console.log('Response as formatted message');
-                        sendFBMessage(sender, responseData.facebook);
-                    } catch (err) {
-                        sendFBMessage(sender, {text: err.message });
+                    if (!Array.isArray(responseData.facebook)) {
+                        try {
+                            console.log('Response as formatted message');
+                            sendFBMessage(sender, responseData.facebook);
+                        } catch (err) {
+                            sendFBMessage(sender, {text: err.message});
+                        }
+                    } else {
+                        async.eachSeries(responseData.facebook, (facebookMessage, callback) => {
+                            try {
+                                if (facebookMessage.sender_action) {
+                                    console.log('Response as sender action');
+                                    sendFBSenderAction(sender, facebookMessage.sender_action, callback);
+                                }
+                                else {
+                                    console.log('Response as formatted message');
+                                    sendFBMessage(sender, facebookMessage, callback);
+                                }
+                            } catch (err) {
+                                sendFBMessage(sender, {text: err.message}, callback);
+                            }
+                        });
                     }
                 } else if (isDefined(responseText)) {
                     console.log('Response as text message');
                     // facebook API limit for text length is 320,
-                    // so we split message if needed
+                    // so we must split message if needed
                     var splittedText = splitResponse(responseText);
 
                     async.eachSeries(splittedText, (textPart, callback) => {
@@ -74,42 +92,35 @@ function processEvent(event) {
 }
 
 function splitResponse(str) {
-    if (str.length <= 320)
-    {
+    if (str.length <= 320) {
         return [str];
     }
 
-    var result = chunkString(str, 300);
-
-    return result;
-
+    return chunkString(str, 300);
 }
 
-function chunkString(s, len)
-{
+function chunkString(s, len) {
     var curr = len, prev = 0;
 
     var output = [];
 
-    while(s[curr]) {
-        if(s[curr++] == ' ') {
-            output.push(s.substring(prev,curr));
+    while (s[curr]) {
+        if (s[curr++] == ' ') {
+            output.push(s.substring(prev, curr));
             prev = curr;
             curr += len;
         }
-        else
-        {
+        else {
             var currReverse = curr;
             do {
-                if(s.substring(currReverse - 1, currReverse) == ' ')
-                {
-                    output.push(s.substring(prev,currReverse));
+                if (s.substring(currReverse - 1, currReverse) == ' ') {
+                    output.push(s.substring(prev, currReverse));
                     prev = currReverse;
                     curr = currReverse + len;
                     break;
                 }
                 currReverse--;
-            } while(currReverse > prev)
+            } while (currReverse > prev)
         }
     }
     output.push(s.substr(prev));
@@ -125,7 +136,7 @@ function sendFBMessage(sender, messageData, callback) {
             recipient: {id: sender},
             message: messageData
         }
-    }, function (error, response, body) {
+    }, (error, response, body) => {
         if (error) {
             console.log('Error sending message: ', error);
         } else if (response.body.error) {
@@ -138,12 +149,35 @@ function sendFBMessage(sender, messageData, callback) {
     });
 }
 
+function sendFBSenderAction(sender, action, callback) {
+    setTimeout(() => {
+        request({
+            url: 'https://graph.facebook.com/v2.6/me/messages',
+            qs: {access_token: FB_PAGE_ACCESS_TOKEN},
+            method: 'POST',
+            json: {
+                recipient: {id: sender},
+                sender_action: action
+            }
+        }, (error, response, body) => {
+            if (error) {
+                console.log('Error sending action: ', error);
+            } else if (response.body.error) {
+                console.log('Error: ', response.body.error);
+            }
+            if (callback) {
+                callback();
+            }
+        });
+    }, 1000);
+}
+
 function doSubscribeRequest() {
     request({
             method: 'POST',
             uri: "https://graph.facebook.com/v2.6/me/subscribed_apps?access_token=" + FB_PAGE_ACCESS_TOKEN
         },
-        function (error, response, body) {
+        (error, response, body) => {
             if (error) {
                 console.error('Error while subscription: ', error);
             } else {
@@ -166,13 +200,13 @@ function isDefined(obj) {
 
 const app = express();
 
-app.use(bodyParser.text({ type: 'application/json' }));
+app.use(bodyParser.text({type: 'application/json'}));
 
-app.get('/webhook/', function (req, res) {
+app.get('/webhook/', (req, res) => {
     if (req.query['hub.verify_token'] == FB_VERIFY_TOKEN) {
         res.send(req.query['hub.challenge']);
-        
-        setTimeout(function () {
+
+        setTimeout(() => {
             doSubscribeRequest();
         }, 3000);
     } else {
@@ -180,15 +214,25 @@ app.get('/webhook/', function (req, res) {
     }
 });
 
-app.post('/webhook/', function (req, res) {
+app.post('/webhook/', (req, res) => {
     try {
         var data = JSONbig.parse(req.body);
 
-        var messaging_events = data.entry[0].messaging;
-        for (var i = 0; i < messaging_events.length; i++) {
-            var event = data.entry[0].messaging[i];
-            processEvent(event);
+        if (data.entry) {
+            let entries = data.entry;
+            entries.forEach((entry) => {
+                let messaging_events = entry.messaging;
+                if (messaging_events) {
+                    messaging_events.forEach((event) => {
+                        if (event.message && !event.message.is_echo ||
+                            event.postback && event.postback.payload) {
+                            processEvent(event);
+                        }
+                    });
+                }
+            });
         }
+
         return res.status(200).json({
             status: "ok"
         });
@@ -201,7 +245,7 @@ app.post('/webhook/', function (req, res) {
 
 });
 
-app.listen(REST_PORT, function () {
+app.listen(REST_PORT, () => {
     console.log('Rest service ready on port ' + REST_PORT);
 });
 
